@@ -1,0 +1,415 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  MANAGER
+}
+
+enum ListingStatus {
+  IN_PROGRESS      // User is still creating the listing
+  PENDING_APPROVAL // Submitted for admin review
+  APPROVED         // Approved and visible
+  REJECTED         // Rejected with feedback
+  DEACTIVATED      // Temporarily removed by user or admin
+}
+
+enum BookingStatus {
+  GUEST_REQUESTED   // Initial reservation request by guest, not yet sent to host
+  HOST_PENDING      // Host needs to respond to the request
+  PENDING_PAYMENT   // Host approved, waiting for guest payment
+  CONFIRMED         // Payment completed, booking is confirmed, guest pending arrival
+  REJECTED          // Host rejected the booking
+  EXPIRED           // Host didn't respond in time or guest didn't pay in time
+  CANCELLED         // Guest cancelled the booking
+}
+
+enum PrivacyLevel {
+  ENTIRE_PLACE
+  PRIVATE_ROOM
+  SHARED_ROOM
+}
+
+enum TransactionType {
+  DEPOSIT      // User deposits money to their wallet
+  WITHDRAW     // User withdraws money from their wallet
+  EARNING      // Host earnings from bookings
+  COMMISSION   // Platform commission from bookings
+  PAYMENT      // Guest payment for booking
+  REFUND       // Refund to guest
+  BONUS        // Bonus credit from platform (non-withdrawable)
+  REWARD       // Reward for actions like first booking (non-withdrawable)
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// Generic signal quality for mobile reception (آنتن دهی)
+enum SignalQuality {
+  WEAK       // ضعیف
+  NORMAL     // معمولی
+  GOOD       // خوب
+  EXCELLENT  // عالی
+}
+
+// Supported Iranian mobile operators (for per-operator coverage, optional)
+enum MobileOperator {
+  IR_MCI         // همراه اول
+  IRANCELL       // ایرانسل
+  RIGHTEL        // رایتل
+  SHATEL_MOBILE  // شاتل موبایل
+}
+
+// Amenity categories for grouping and UI/SEO
+enum AmenityCategory {
+  ESSENTIALS
+  FEATURES
+  LOCATION
+  SAFETY
+  SERVICES
+}
+
+// New enum for bed types
+enum BedType {
+  SINGLE          // تخت یک نفره
+  DOUBLE          // تخت دو نفره
+  SOFA_BED        // مبل تختخواب شو
+  BUNK_BED        // تخت دو طبقه
+}
+
+model User {
+  id                Int       @id @default(autoincrement())
+  email             String?   @unique
+  phoneNumber       String    @unique
+  role              Role      @default(USER)
+  hashedPassword    String?
+  firstName         String
+  lastName          String
+  image             String?
+  isHost            Boolean   @default(false)
+  nationalId        String?   @unique
+  nationalIdImage   String?
+  verificationCode  String?
+  verificationCodeExpiry DateTime?
+  
+  // Balance fields
+  withdrawableBalance Int     @default(0)
+  bonusBalance       Int     @default(0)
+  
+  bankInfo          Json?
+  
+  // Moderation fields
+  isBanned          Boolean   @default(false)
+  banReason         String?
+  bannedAt          DateTime?
+  bannedBy          Int?
+  bannerUser        User?     @relation("BannedUsers", fields: [bannedBy], references: [id])
+  bannedUsers       User[]    @relation("BannedUsers")
+  
+  // Soft delete
+  isDeleted         Boolean   @default(false)
+  deletedAt         DateTime?
+  
+  // Timestamps
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  
+  // Relations
+  listings          Listing[]
+  bookings         Booking[]  // As a guest
+  hostedBookings   Booking[] @relation("HostBookings") // As a host
+  reviews          Review[]   // Reviews written
+  receivedReviews  Review[]  @relation("ReceivedReviews") // Reviews received
+  messages         Message[]  // Messages sent
+  receivedMessages Message[] @relation("ReceivedMessages") // Messages received
+  transactions     Transaction[]
+  wishlists        Listing[]  @relation("UserLikes")
+  settings         UserSettings?
+
+  @@map("users")
+}
+
+model UserSettings {
+  id                  Int       @id @default(autoincrement())
+  userId             Int       @unique
+  user               User      @relation(fields: [userId], references: [id])
+  emailNotifications Boolean   @default(true)
+  smsNotifications   Boolean   @default(true)
+  language           String    @default("fa")
+  timezone           String    @default("asia-tehran")
+  loginNotifications Boolean   @default(true)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@map("user_settings")
+}
+
+model Listing {
+  id              Int           @id @default(autoincrement())
+  listingCode     String?        @unique // New field for 7-digit identifier
+  hostId          Int
+  host            User          @relation(fields: [hostId], references: [id])
+  title           String?       // Optional for drafts
+  description     String?       @db.Text // Optional for drafts
+  category        String?
+  instantBooking  Boolean       @default(false)
+  privacyLevel    PrivacyLevel  @default(ENTIRE_PLACE)
+  state           String?       // Optional for drafts
+  city            String?       // Optional for drafts
+  address         String?       // Optional for drafts
+  latitude        Float?        // Optional for drafts
+  longitude       Float?        // Optional for drafts
+  photos          String[]      @default([])
+  documents       String[]      @default([])  // Array of document URLs (PDFs/images)
+  amenities       String[]      @default([])
+  rules           String[]      @default([])
+  rooms           Json[]        @default([])  // Store room data as JSON
+  bathCount       Int          @default(1)
+  toiletCount     Int          @default(1)
+  baseGuestCount  Int          @default(2)    // Number of guests included in base price
+  maxExtraGuests  Int          @default(0)    // Maximum number of additional guests allowed
+  extraGuestPrice Int?                        // Price per additional guest
+  minStay         Int          @default(1)
+  checkinTime     String?      // Time for check-in (e.g., "14:00")
+  checkoutTime    String?      // Time for check-out (e.g., "12:00")
+  price           Int?         // Optional for drafts
+  weekendPrice    Int?
+  holidayPrice    Int?
+  status          ListingStatus @default(IN_PROGRESS)
+  isDraft         Boolean       @default(true)
+  isActive        Boolean       @default(true)
+  step            Int           @default(0)
+  approvedAt      DateTime?
+  approvedBy      Int?
+  rejectionReason String?
+  averageRating   Float         @default(0)  
+  reviewCount     Int           @default(0)  
+  // Generic mobile reception quality (آنتن دهی)
+  signalQuality   SignalQuality @default(NORMAL)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // Relations
+  bookings        Booking[]
+  reviews         Review[]
+  messages        Message[]
+  calendars       Calendar[]
+  likedByUsers    User[]        @relation("UserLikes")
+  operatorCoverage ListingOperatorCoverage[]
+  amenitiesRel    ListingAmenity[]
+
+  @@unique([id, hostId], name: "id_hostId")
+  @@index([hostId])
+  // Speed up city + status filters for SEO pages
+  @@index([city, status])
+  @@map("listings")
+}
+
+model Booking {
+  id                  Int       @id @default(autoincrement())
+  listingId           Int
+  listing             Listing   @relation(fields: [listingId], references: [id])
+  guestId             Int
+  guest               User      @relation(fields: [guestId], references: [id])
+  hostId              Int
+  host                User      @relation("HostBookings", fields: [hostId], references: [id])
+  startDate           DateTime
+  endDate             DateTime
+  numberOfGuests      Int
+  totalPrice          Int
+  commission          Int       @default(0)
+  status              BookingStatus @default(GUEST_REQUESTED)
+  hostResponseDeadline DateTime?
+  paymentDue          DateTime?
+  hostRejectionReason String?
+  cancellationReason  String?
+  bookingCode         String?
+  transaction         Transaction?
+  messages            Message[]
+  review              Review?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@map("bookings")
+}
+
+model Calendar {
+  id                 Int      @id @default(autoincrement())
+  listingId         Int
+  date             DateTime
+  price            Int
+  isAvailable      Boolean   @default(true)
+  isReserved       Boolean   @default(false)
+  instantReservation Boolean  @default(false)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Relations
+  listing          Listing   @relation(fields: [listingId], references: [id])
+
+  @@unique([listingId, date])
+  @@index([listingId])
+  @@map("calendars")
+}
+
+model Review {
+  id          Int      @id @default(autoincrement())
+  userId      Int      // Author of the review
+  receiverId  Int?     // User being reviewed (optional)
+  listingId   Int
+  bookingId   Int?     @unique
+  rating      Int
+  comment     String   @db.Text
+  hostResponse String?  @db.Text  // New: Allow hosts to respond to reviews
+  isHidden    Boolean  @default(false)  // New: For hiding inappropriate reviews
+  isApproved  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
+  receiver    User?    @relation("ReceivedReviews", fields: [receiverId], references: [id])
+  listing     Listing  @relation(fields: [listingId], references: [id])
+  booking     Booking? @relation(fields: [bookingId], references: [id])
+
+  @@index([userId])
+  @@index([receiverId])
+  @@index([listingId])
+  @@map("reviews")
+}
+
+model Message {
+  id             Int          @id @default(autoincrement())
+  senderId       Int
+  sender         User         @relation(fields: [senderId], references: [id])
+  receiverId     Int
+  receiver       User         @relation("ReceivedMessages", fields: [receiverId], references: [id])
+  listingId      Int
+  listing        Listing      @relation(fields: [listingId], references: [id])
+  bookingId      Int?
+  booking        Booking?     @relation(fields: [bookingId], references: [id])
+  text           String       @db.Text
+  isRead         Boolean      @default(false)
+  isMonitored    Boolean      @default(false)  // For manager monitoring
+  monitoredBy    Int?         // Manager who monitored this message
+  monitoredAt    DateTime?    // When it was monitored
+  isDeleted      Boolean      @default(false)  // For moderation
+  deletedBy      Int?         // Manager who deleted the message
+  deletedAt      DateTime?    // When it was deleted
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@map("messages")
+}
+
+model Transaction {
+  id              Int              @id @default(autoincrement())
+  userId          Int
+  user            User             @relation(fields: [userId], references: [id])
+  amount          Int
+  authority       String?          @unique
+  type            TransactionType
+  status          TransactionStatus
+  description     String
+  isWithdrawable  Boolean         @default(true)  // Whether this amount can be withdrawn
+  metadata        Json?            // For storing payment gateway responses, bank info, etc.
+  bookingId       Int?            @unique
+  booking         Booking?        @relation(fields: [bookingId], references: [id])
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@map("transactions")
+}
+
+// Optional per-operator mobile coverage for a listing
+model ListingOperatorCoverage {
+  id         Int            @id @default(autoincrement())
+  listingId  Int
+  listing    Listing        @relation(fields: [listingId], references: [id])
+  operator   MobileOperator
+  quality    SignalQuality
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([listingId, operator])
+  @@index([listingId])
+  @@map("listing_operator_coverage")
+}
+
+// Normalized amenity catalog for robust filtering/SEO
+model Amenity {
+  id         Int      @id @default(autoincrement())
+  key        String   @unique // canonical key, e.g. "pool"
+  nameFa     String   // display name in Persian, e.g. "استخردار"
+  iconKey    String?  // lucide icon identifier, e.g. "wifi"
+  category   AmenityCategory @default(FEATURES)
+  isFilterable Boolean @default(true)
+  isSeoLanding Boolean @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  listings   ListingAmenity[]
+
+  @@map("amenities")
+}
+
+// Many-to-many relation between Listing and Amenity with simple value support
+model ListingAmenity {
+  id         Int      @id @default(autoincrement())
+  listingId  Int
+  listing    Listing  @relation(fields: [listingId], references: [id])
+  amenityId  Int
+  amenity    Amenity  @relation(fields: [amenityId], references: [id])
+  // For boolean amenities like pool; can be extended later
+  valueBool  Boolean? @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([listingId, amenityId])
+  @@index([listingId])
+  @@index([amenityId])
+  @@map("listing_amenities")
+}
+
+// Normalized geographic data for Iran
+model State {
+  id       Int     @id @default(autoincrement())
+  slug     String  @unique
+  nameFa   String
+  nameEn   String?
+  latitude       Float? 
+  longitude       Float?
+  cities   City[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("states")
+}
+
+model City {
+  id       Int     @id @default(autoincrement())
+  stateId  Int
+  state    State   @relation(fields: [stateId], references: [id])
+  slug     String  @unique
+  nameFa   String
+  nameEn   String?
+  latitude       Float? 
+  longitude       Float?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([stateId])
+  @@map("cities")
+}
