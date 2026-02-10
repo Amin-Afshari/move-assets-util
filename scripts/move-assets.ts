@@ -10,6 +10,37 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+function getArvanPrefix(): string {
+  const endpoint = process.env.ARVAN_ENDPOINT;
+  const bucket = process.env.ARVAN_BUCKET || process.env.ARVAN_BUCKET_NAME;
+  if (!endpoint) throw new Error("Missing ARVAN_ENDPOINT");
+  if (!bucket) throw new Error("Missing ARVAN_BUCKET or ARVAN_BUCKET_NAME");
+  const endpointClean = endpoint.replace(/^https?:\/\//, "");
+  return `https://${bucket}.${endpointClean}/`;
+}
+
+function isHttpUrl(value: string): boolean {
+  return /^https?:\/\//.test(value);
+}
+
+function getObjectKeyFromCloudinaryUrl(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const segments = u.pathname.split("/").filter(Boolean);
+    const uploadIndex = segments.findIndex((s) => s === "upload");
+    if (uploadIndex === -1) return null;
+    const afterUpload = segments.slice(uploadIndex + 1);
+    const versionIndex = afterUpload.findIndex((s) => /^v\d+$/.test(s));
+    const publicIdSegments =
+      versionIndex >= 0 ? afterUpload.slice(versionIndex + 1) : afterUpload;
+    const publicId = publicIdSegments.join("/");
+    if (!publicId) return null;
+    return publicId.replace(/^jayeman\//, "");
+  } catch {
+    return null;
+  }
+}
+
 function getDownloadStream(url: string): Promise<Readable> {
   console.log(`    -> Starting download stream: ${url}`);
   return new Promise((resolve, reject) => {
@@ -37,7 +68,6 @@ function getDownloadStream(url: string): Promise<Readable> {
   });
 }
 
-// Global error handlers to prevent silent exits
 process.on("uncaughtException", (err) => {
   console.error("CRITICAL: Uncaught Exception:", err);
   process.exit(1);
@@ -50,138 +80,129 @@ process.on("unhandledRejection", (reason, promise) => {
     "reason:",
     reason,
   );
-  // Do not exit here to see if the loop can recover, or exit if preferred
 });
 
-const MAX_LISTINGS_PER_RUN = 5; // Process only 5 listings then exit to clear memory
+const MAX_LISTINGS_PER_RUN = 5;
 
 async function main() {
   console.log("Starting migration batch...");
+  const arvanPrefix = getArvanPrefix();
+  const arvanLike = `${arvanPrefix}%`;
 
-  // Log initial memory
   const used = process.memoryUsage().heapUsed / 1024 / 1024;
   console.log(`Initial Memory Usage: ${Math.round(used * 100) / 100} MB`);
 
-  // Get total count for progress
-  const totalListings = await prisma.listing.count();
-  console.log(`Found ${totalListings} listings.`);
+  const candidates = await prisma.$queryRaw<
+    Array<{ id: number; photos: string[] }>
+  >`
+    SELECT id, photos
+    FROM listings
+    WHERE EXISTS (
+      SELECT 1
+      FROM unnest(photos) AS p
+      WHERE p NOT LIKE ${arvanLike}
+    )
+    ORDER BY id ASC
+    LIMIT ${MAX_LISTINGS_PER_RUN}
+  `;
 
-  let processedCount = 0;
-  const batchSize = 1; // Fetch one by one to keep memory low
-  let cursorId: number | undefined;
-  let listingsProcessedInRun = 0;
+  if (candidates.length === 0) {
+    console.log(
+      "No listings with unmigrated photos found. Migration complete.",
+    );
+    return;
+  }
 
-  while (true) {
-    if (listingsProcessedInRun >= MAX_LISTINGS_PER_RUN) {
+  console.log(`Found ${candidates.length} candidate listings in this batch.`);
+
+  for (const [listingIndex, listing] of candidates.entries()) {
+    console.log(
+      `Processing listing ${listing.id} (${listingIndex + 1}/${candidates.length})`,
+    );
+
+    let migratedCount = 0;
+    let failedCount = 0;
+    const newPhotos: string[] = [...listing.photos];
+
+    const totalPhotos = listing.photos.length;
+    if (totalPhotos > 0) {
       console.log(
-        `Reached limit of ${MAX_LISTINGS_PER_RUN} listings. Exiting for restart.`,
+        `  Found ${totalPhotos} photos. Checking for migration needs...`,
       );
-      break;
     }
 
-    const listings = await prisma.listing.findMany({
-      take: batchSize,
-      skip: cursorId ? 1 : 0,
-      cursor: cursorId ? { id: cursorId } : undefined,
-      orderBy: { id: "asc" },
-    });
-
-    if (listings.length === 0) break;
-
-    for (const listing of listings) {
-      cursorId = listing.id;
-      processedCount++;
-      listingsProcessedInRun++;
-
-      console.log(
-        `Processing listing ${listing.id} (${processedCount}/${totalListings})`,
-      );
-
-      let migratedCount = 0;
-      let failedCount = 0;
-      // Initialize newPhotos with existing photos to maintain order
-      const newPhotos: string[] = [...listing.photos];
-
-      const totalPhotos = listing.photos.length;
-      if (totalPhotos > 0) {
+    for (const [index, photo] of listing.photos.entries()) {
+      if (isHttpUrl(photo) && photo.startsWith(arvanPrefix)) {
         console.log(
-          `  Found ${totalPhotos} photos. Checking for migration needs...`,
+          `  Skipping photo ${index + 1}/${totalPhotos}: already Arvan`,
         );
+        continue;
       }
 
-      for (const [index, photo] of listing.photos.entries()) {
-        // Resume check: if it starts with https, assume it's already migrated or valid
-        if (photo.startsWith("https://")) {
-          continue;
-        }
+      console.log(`  Migrating photo ${index + 1}/${totalPhotos}: ${photo}`);
 
-        console.log(`  Migrating photo ${index + 1}/${totalPhotos}: ${photo}`);
+      try {
+        const downloadUrl = isHttpUrl(photo)
+          ? photo
+          : cloudinary.url(photo, { secure: true });
 
-        try {
-          // It's a public ID. Construct Cloudinary URL to download.
-          const downloadUrl = cloudinary.url(photo, { secure: true });
+        const stream = await getDownloadStream(downloadUrl);
 
-          const stream = await getDownloadStream(downloadUrl);
+        const key = isHttpUrl(photo)
+          ? (getObjectKeyFromCloudinaryUrl(photo) ??
+            new URL(photo).pathname
+              .replace(/^\/+/, "")
+              .replace(/^jayeman\//, ""))
+          : photo.replace(/^jayeman\//, "");
 
-          const key = photo.replace(/^jayeman\//, "");
-
-          // Race the upload against a 60s timeout
-          const uploadPromise = uploadStream({ stream, key });
-          const timeoutPromise = new Promise<string>((_, reject) =>
-            setTimeout(
-              () => reject(new Error("Upload timed out after 60s")),
-              60000,
-            ),
-          );
-
-          const newUrl = await Promise.race([uploadPromise, timeoutPromise]);
-
-          // Update the specific photo in our local array
-          newPhotos[index] = newUrl;
-          migratedCount++;
-          console.log(`  ✅ Success: ${newUrl}`);
-
-          // INCREMENTAL SAVE: Update DB immediately after each success
-          await prisma.listing.update({
-            where: { id: listing.id },
-            data: { photos: newPhotos },
-          });
-        } catch (error) {
-          console.error(
-            `  ❌ Failed to migrate photo ${photo}:`,
-            error instanceof Error ? error.message : error,
-          );
-          failedCount++;
-        }
-
-        // Log memory after each photo
-        const currentMem = process.memoryUsage().heapUsed / 1024 / 1024;
-        if (currentMem > 500) {
-          // Warn if heap > 500MB
-          console.warn(
-            `  ⚠️ High Memory Usage: ${Math.round(currentMem * 100) / 100} MB`,
-          );
-          if (global.gc) {
-            console.log("  Running Garbage Collection...");
-            global.gc();
-          }
-        }
-      }
-
-      if (migratedCount === 0 && failedCount === 0 && totalPhotos > 0) {
-        console.log(`  No changes needed. All photos were already migrated.`);
-      } else if (failedCount > 0) {
-        console.log(
-          `  ⚠️ Finished listing with errors. Failed: ${failedCount}`,
+        const uploadPromise = uploadStream({ stream, key });
+        const timeoutPromise = new Promise<string>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Upload timed out after 60s")),
+            60000,
+          ),
         );
+
+        const newUrl = await Promise.race([uploadPromise, timeoutPromise]);
+
+        newPhotos[index] = newUrl;
+        migratedCount++;
+        console.log(`  ✅ Success: ${newUrl}`);
+
+        await prisma.listing.update({
+          where: { id: listing.id },
+          data: { photos: newPhotos },
+        });
+      } catch (error) {
+        console.error(
+          `  ❌ Failed to migrate photo ${photo}:`,
+          error instanceof Error ? error.message : error,
+        );
+        failedCount++;
       }
+
+      const currentMem = process.memoryUsage().heapUsed / 1024 / 1024;
+      if (currentMem > 500) {
+        console.warn(
+          `  ⚠️ High Memory Usage: ${Math.round(currentMem * 100) / 100} MB`,
+        );
+        if (global.gc) {
+          console.log("  Running Garbage Collection...");
+          global.gc();
+        }
+      }
+    }
+
+    if (migratedCount === 0 && failedCount === 0 && totalPhotos > 0) {
+      console.log(`  No changes needed. All photos were already migrated.`);
+    } else if (failedCount > 0) {
+      console.log(`  ⚠️ Finished listing with errors. Failed: ${failedCount}`);
     }
   }
 
   console.log("Batch complete.");
 }
 
-// Only run if this file is the main entry point
 if (import.meta.main) {
   main()
     .catch((e) => {
