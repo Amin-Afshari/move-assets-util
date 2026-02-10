@@ -53,18 +53,32 @@ process.on("unhandledRejection", (reason, promise) => {
   // Do not exit here to see if the loop can recover, or exit if preferred
 });
 
+const MAX_LISTINGS_PER_RUN = 5; // Process only 5 listings then exit to clear memory
+
 async function main() {
-  console.log("Starting migration...");
+  console.log("Starting migration batch...");
+
+  // Log initial memory
+  const used = process.memoryUsage().heapUsed / 1024 / 1024;
+  console.log(`Initial Memory Usage: ${Math.round(used * 100) / 100} MB`);
 
   // Get total count for progress
   const totalListings = await prisma.listing.count();
   console.log(`Found ${totalListings} listings.`);
 
   let processedCount = 0;
-  const batchSize = 10;
+  const batchSize = 1; // Fetch one by one to keep memory low
   let cursorId: number | undefined;
+  let listingsProcessedInRun = 0;
 
   while (true) {
+    if (listingsProcessedInRun >= MAX_LISTINGS_PER_RUN) {
+      console.log(
+        `Reached limit of ${MAX_LISTINGS_PER_RUN} listings. Exiting for restart.`,
+      );
+      break;
+    }
+
     const listings = await prisma.listing.findMany({
       take: batchSize,
       skip: cursorId ? 1 : 0,
@@ -77,6 +91,7 @@ async function main() {
     for (const listing of listings) {
       cursorId = listing.id;
       processedCount++;
+      listingsProcessedInRun++;
 
       console.log(
         `Processing listing ${listing.id} (${processedCount}/${totalListings})`,
@@ -85,7 +100,8 @@ async function main() {
       let hasChanges = false;
       let migratedCount = 0;
       let failedCount = 0;
-      const newPhotos: string[] = [];
+      // Initialize newPhotos with existing photos to maintain order
+      const newPhotos: string[] = [...listing.photos];
 
       const totalPhotos = listing.photos.length;
       if (totalPhotos > 0) {
@@ -97,8 +113,6 @@ async function main() {
       for (const [index, photo] of listing.photos.entries()) {
         // Resume check: if it starts with https, assume it's already migrated or valid
         if (photo.startsWith("https://")) {
-          // console.log(`  Skipping photo ${index + 1}/${totalPhotos}: Already migrated.`);
-          newPhotos.push(photo);
           continue;
         }
 
@@ -108,48 +122,65 @@ async function main() {
           // It's a public ID. Construct Cloudinary URL to download.
           const downloadUrl = cloudinary.url(photo, { secure: true });
 
-          // console.log(`  Downloading...`);
           const stream = await getDownloadStream(downloadUrl);
 
-          // Use the photo path (public ID) but strip the 'jayeman/' prefix since the bucket is already named jayeman
-          // e.g. "jayeman/listings/1/file_sdyogz" -> "listings/1/file_sdyogz"
           const key = photo.replace(/^jayeman\//, "");
 
-          // console.log(`  Uploading...`);
-          const newUrl = await uploadStream({ stream, key });
+          // Race the upload against a 60s timeout
+          const uploadPromise = uploadStream({ stream, key });
+          const timeoutPromise = new Promise<string>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("Upload timed out after 60s")),
+              60000,
+            ),
+          );
 
-          newPhotos.push(newUrl);
+          const newUrl = await Promise.race([uploadPromise, timeoutPromise]);
+
+          // Update the specific photo in our local array
+          newPhotos[index] = newUrl;
           hasChanges = true;
           migratedCount++;
           console.log(`  ✅ Success: ${newUrl}`);
+
+          // INCREMENTAL SAVE: Update DB immediately after each success
+          await prisma.listing.update({
+            where: { id: listing.id },
+            data: { photos: newPhotos },
+          });
         } catch (error) {
           console.error(
             `  ❌ Failed to migrate photo ${photo}:`,
             error instanceof Error ? error.message : error,
           );
-          // Keep the old one if failed, so we can retry later (since it won't be https)
-          newPhotos.push(photo);
           failedCount++;
+        }
+
+        // Log memory after each photo
+        const currentMem = process.memoryUsage().heapUsed / 1024 / 1024;
+        if (currentMem > 500) {
+          // Warn if heap > 500MB
+          console.warn(
+            `  ⚠️ High Memory Usage: ${Math.round(currentMem * 100) / 100} MB`,
+          );
+          if (global.gc) {
+            console.log("  Running Garbage Collection...");
+            global.gc();
+          }
         }
       }
 
-      if (hasChanges) {
-        await prisma.listing.update({
-          where: { id: listing.id },
-          data: { photos: newPhotos },
-        });
-        console.log(
-          `  💾 Saved changes to DB. Migrated: ${migratedCount}, Failed: ${failedCount}`,
-        );
-      } else if (migratedCount === 0 && failedCount === 0 && totalPhotos > 0) {
+      if (migratedCount === 0 && failedCount === 0 && totalPhotos > 0) {
         console.log(`  No changes needed. All photos were already migrated.`);
       } else if (failedCount > 0) {
-        console.log(`  ⚠️ Finished with errors. Failed: ${failedCount}`);
+        console.log(
+          `  ⚠️ Finished listing with errors. Failed: ${failedCount}`,
+        );
       }
     }
   }
 
-  console.log("Migration complete.");
+  console.log("Batch complete.");
 }
 
 // Only run if this file is the main entry point
