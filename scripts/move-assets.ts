@@ -10,8 +10,9 @@ cloudinary.config({
 });
 
 export async function downloadFile(url: string): Promise<Buffer> {
+  console.log(`    -> Starting download: ${url}`);
   return new Promise((resolve, reject) => {
-    https
+    const req = https
       .get(url, (res) => {
         if (res.statusCode !== 200) {
           reject(
@@ -23,10 +24,25 @@ export async function downloadFile(url: string): Promise<Buffer> {
         }
         const data: Buffer[] = [];
         res.on("data", (chunk) => data.push(chunk));
-        res.on("end", () => resolve(Buffer.concat(data)));
-        res.on("error", reject);
+        res.on("end", () => {
+          console.log(`    -> Download complete: ${url}`);
+          resolve(Buffer.concat(data));
+        });
+        res.on("error", (err) => {
+          console.error(`    -> Download stream error: ${err.message}`);
+          reject(err);
+        });
       })
-      .on("error", reject);
+      .on("error", (err) => {
+        console.error(`    -> Request error: ${err.message}`);
+        reject(err);
+      });
+
+    // Set a timeout for the request
+    req.setTimeout(30000, () => {
+      console.error(`    -> Request timed out: ${url}`);
+      req.destroy(new Error("Request timed out"));
+    });
   });
 }
 
