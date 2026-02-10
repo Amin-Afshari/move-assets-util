@@ -1,8 +1,10 @@
+import { Upload } from "@aws-sdk/lib-storage";
 import {
   DeleteObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { Readable } from "stream";
 
 function getRequiredEnv(key: string) {
   const value = process.env[key];
@@ -75,6 +77,34 @@ export async function uploadBuffer({
       ACL: "public-read",
     }),
   );
+
+  return getFileUrl(key);
+}
+
+export async function uploadStream({
+  stream,
+  key,
+  contentType = "image/jpeg",
+}: {
+  stream: Readable | ReadableStream;
+  key: string;
+  contentType?: string;
+}) {
+  const bucket = process.env.ARVAN_BUCKET || process.env.ARVAN_BUCKET_NAME;
+  if (!bucket) throw new Error("Missing ARVAN_BUCKET or ARVAN_BUCKET_NAME");
+
+  const upload = new Upload({
+    client,
+    params: {
+      Bucket: bucket,
+      Key: key,
+      Body: stream,
+      ContentType: contentType,
+      ACL: "public-read",
+    },
+  });
+
+  await upload.done();
 
   return getFileUrl(key);
 }
