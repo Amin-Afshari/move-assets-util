@@ -97,7 +97,6 @@ async function main() {
         `Processing listing ${listing.id} (${processedCount}/${totalListings})`,
       );
 
-      let hasChanges = false;
       let migratedCount = 0;
       let failedCount = 0;
       // Initialize newPhotos with existing photos to maintain order
@@ -139,7 +138,6 @@ async function main() {
 
           // Update the specific photo in our local array
           newPhotos[index] = newUrl;
-          hasChanges = true;
           migratedCount++;
           console.log(`  ✅ Success: ${newUrl}`);
 
